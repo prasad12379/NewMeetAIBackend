@@ -8,7 +8,7 @@ from database import users_collection as user_collection
 from utils.auth import hash_password, verify_password, create_token
 
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
-HF_API_URL   = "https://api-inference.huggingface.co/models/sshleifer/distilbart-cnn-12-6"
+HF_API_URL = "https://router.huggingface.co/hf-inference/models/sshleifer/distilbart-cnn-12-6/v1/chat/completions"
 
 app = FastAPI(title="MeetAI Auth API")
 
