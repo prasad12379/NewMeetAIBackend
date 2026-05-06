@@ -89,23 +89,41 @@ async def summarize(file: UploadFile = File(...)):
 
     cleaned = clean_text(text)
 
-    # Call HuggingFace Inference API
+    # Truncate to 1000 chars — HF free API rejects very long inputs
+    cleaned = cleaned[:1000]
+
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             HF_API_URL,
-            headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
-            json={"inputs": cleaned}
+            headers={
+                "Authorization": f"Bearer {HF_API_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "inputs": cleaned,
+                "parameters": {
+                    "max_length": 130,
+                    "min_length": 40,
+                    "do_sample": False
+                }
+            }
         )
 
+    # Log the REAL error so you can see it in Render logs
     if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Summarization failed. Try again.")
+        raise HTTPException(
+            status_code=500,
+            detail=f"HF API error {response.status_code}: {response.text}"
+        )
 
     result = response.json()
+
+    # Guard against unexpected response shape
+    if not result or not isinstance(result, list) or "summary_text" not in result[0]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected HF response: {result}"
+        )
+
     summary = result[0]["summary_text"].strip()
-
     return {"summary": summary}
-
-
-@app.get("/")
-def root():
-    return {"status": "MeetAI API is running."}
