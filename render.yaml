@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: new-meetai
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: MONGO_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
