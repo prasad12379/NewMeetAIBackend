@@ -6,7 +6,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from models import SignUpRequest, LoginRequest, AuthResponse, User
 from database import users_collection as user_collection
 from utils.auth import hash_password, verify_password, create_token
-
+import asyncio  
 import tempfile
 import shutil
 from pathlib import Path
@@ -38,9 +38,9 @@ def clean_text(text: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════
-# CHUNKER — splits large text into 900-char chunks
+# CHUNKER — splits large text into 1800-char chunks
 # ══════════════════════════════════════════════════════════
-def chunk_text(text: str, max_chars: int = 900) -> list[str]:
+def chunk_text(text: str, max_chars: int = 1800) -> list[str]:
     sentences = text.split(". ")
     chunks, current = [], ""
 
@@ -59,52 +59,94 @@ def chunk_text(text: str, max_chars: int = 900) -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════
-# HF SUMMARIZER — handles large text via chunking
+# HF SUMMARIZER — hierarchical, preserves detail
 # ══════════════════════════════════════════════════════════
-async def hf_summarize(text: str) -> str:
+async def hf_summarize_chunk(client: httpx.AsyncClient, text: str, max_length: int = 200, min_length: int = 60) -> str:
     headers = {
         "Authorization": f"Bearer {HF_API_TOKEN}",
         "Content-Type": "application/json"
     }
     payload = {
+        "inputs": text,
         "parameters": {
-            "max_length": 130,
-            "min_length": 40,
+            "max_length": max_length,
+            "min_length": min_length,
             "do_sample": False
         }
     }
 
-    chunks = chunk_text(text)
-    summaries = []
+    response = await client.post(HF_API_URL, headers=headers, json=payload)
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        for chunk in chunks:
-            payload["inputs"] = chunk
-            response = await client.post(HF_API_URL, headers=headers, json=payload)
+    if response.status_code == 503:
+        raise HTTPException(status_code=503, detail="Model is loading, retry in 20 seconds.")
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"HF API error {response.status_code}: {response.text}")
 
-            if response.status_code == 503:
-                raise HTTPException(status_code=503, detail="Model is loading, retry in 20 seconds.")
-            if response.status_code != 200:
-                raise HTTPException(status_code=500, detail=f"HF API error {response.status_code}: {response.text}")
+    result = response.json()
+    if not result or not isinstance(result, list) or "summary_text" not in result[0]:
+        raise HTTPException(status_code=500, detail=f"Unexpected HF response: {result}")
 
-            result = response.json()
-            if not result or not isinstance(result, list) or "summary_text" not in result[0]:
-                raise HTTPException(status_code=500, detail=f"Unexpected HF response: {result}")
+    return result[0]["summary_text"].strip()
 
-            summaries.append(result[0]["summary_text"].strip())
 
-    # If multiple chunks, do a final summarization pass on combined summaries
-    combined = " ".join(summaries)
-    if len(chunks) > 1 and len(combined) > 200:
-        payload["inputs"] = combined[:900]
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(HF_API_URL, headers=headers, json=payload)
-            if response.status_code == 200:
-                final = response.json()
-                if final and isinstance(final, list) and "summary_text" in final[0]:
-                    return final[0]["summary_text"].strip()
+# ══════════════════════════════════════════════════════════
+# GROQ SUMMARIZER — replaces HF BART for better quality
+# ══════════════════════════════════════════════════════════
+async def groq_summarize(text: str) -> str:
+    MAX_CHARS = 12000
+    chunks_to_summarize = [text] if len(text) <= MAX_CHARS else chunk_text(text, max_chars=MAX_CHARS)
+    chunk_summaries = []
 
-    return combined
+    for chunk in chunks_to_summarize:
+        # ✅ asyncio.to_thread — Groq SDK is sync, must run in thread pool
+        response = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert meeting summarizer. "
+                        "Produce a detailed structured summary covering: "
+                        "1) Key discussion points, "
+                        "2) Decisions made, "
+                        "3) Problems or challenges identified, "
+                        "4) Action items and who is responsible, "
+                        "5) Next steps and deadlines. "
+                        "Be thorough. Do not skip any department or topic."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Summarize this meeting transcript:\n\n{chunk}"
+                }
+            ],
+            temperature=0.3,
+            max_tokens=1024,
+        )
+        chunk_summaries.append(response.choices[0].message.content.strip())
+
+    if len(chunk_summaries) == 1:
+        return chunk_summaries[0]
+
+    combined = "\n\n".join(f"[Part {i+1}]\n{s}" for i, s in enumerate(chunk_summaries))
+    final = await asyncio.to_thread(
+        groq_client.chat.completions.create,
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": "Merge these partial meeting summaries into one complete, detailed summary. Do not lose any detail."
+            },
+            {
+                "role": "user",
+                "content": f"Merge:\n\n{combined}"
+            }
+        ],
+        temperature=0.3,
+        max_tokens=1500,
+    )
+    return final.choices[0].message.content.strip()
 
 
 # ══════════════════════════════════════════════════════════
@@ -179,7 +221,7 @@ async def summarize(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="File is empty.")
 
     cleaned = clean_text(text)
-    summary = await hf_summarize(cleaned)
+    summary = await groq_summarize(cleaned)   # ← changed from hf_summarize
 
     return {"summary": summary}
 
