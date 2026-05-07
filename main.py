@@ -7,9 +7,16 @@ from models import SignUpRequest, LoginRequest, AuthResponse, User
 from database import users_collection as user_collection
 from utils.auth import hash_password, verify_password, create_token
 
+import tempfile
+import shutil
+from pathlib import Path
+from groq import Groq
+from fastapi.responses import Response
+
 load_dotenv()
 
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))  # add at top with other clients
 HF_API_URL   = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
 
 app = FastAPI(title="MeetAI Auth API")
@@ -194,3 +201,39 @@ def debug_token():
 @app.get("/")
 def root():
     return {"status": "MeetAI API is running."}
+
+
+# ══════════════════════════════════════════════════════════
+# /transcribe  →  accepts audio, returns .txt file
+# ══════════════════════════════════════════════════════════
+@app.post("/transcribe")
+async def transcribe(file: UploadFile = File(...)):
+    ALLOWED_EXTENSIONS = {".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".webm", ".flac"}
+    suffix = Path(file.filename).suffix.lower()
+
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+        )
+
+    # Groq has a 25MB file size limit
+    contents = await file.read()
+    if len(contents) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Max size is 25MB.")
+
+    try:
+        transcription = groq_client.audio.transcriptions.create(
+            file=(file.filename, contents),
+            model="whisper-large-v3-turbo",
+            response_format="text"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
+    txt_filename = Path(file.filename).stem + "_transcript.txt"
+    return Response(
+        content=transcription,
+        media_type="text/plain",
+        headers={"Content-Disposition": f"attachment; filename={txt_filename}"}
+    )
