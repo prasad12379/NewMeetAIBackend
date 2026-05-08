@@ -6,21 +6,44 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from models import SignUpRequest, LoginRequest, AuthResponse, User
 from database import users_collection as user_collection
 from utils.auth import hash_password, verify_password, create_token
-import asyncio  
+import asyncio
 import tempfile
 import shutil
 from pathlib import Path
 from groq import Groq
 from fastapi.responses import Response
+from pymongo import MongoClient, ASCENDING
+from pymongo.errors import DuplicateKeyError
+from pydantic import BaseModel
+from datetime import datetime, timezone
+from typing import Optional
 
 load_dotenv()
 
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))  # add at top with other clients
+groq_client  = Groq(api_key=os.getenv("GROQ_API_KEY"))
 HF_API_URL   = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
 
 app = FastAPI(title="MeetAI Auth API")
 
+# ══════════════════════════════════════════════════════════
+# MongoDB — Meetings Collection
+# ══════════════════════════════════════════════════════════
+MONGO_URI          = os.getenv("MONGO_URI", "your_mongodb_connection_string")
+meetings_client     = MongoClient(MONGO_URI)
+meetings_db         = meetings_client["meetai"]
+meetings_collection = meetings_db["Meetings"]
+
+# Unique index on room_code — prevents duplicate rooms at DB level
+meetings_collection.create_index("room_code", unique=True)
+
+# ══════════════════════════════════════════════════════════
+# Pydantic Model — /meetings
+# ══════════════════════════════════════════════════════════
+class MeetingRequest(BaseModel):
+    room_code: str
+    email:     str
+    is_admin:  bool
 
 # ══════════════════════════════════════════════════════════
 # TEXT CLEANER
@@ -36,9 +59,8 @@ def clean_text(text: str) -> str:
     )
     return re.sub(r" {2,}", " ", flat).strip()
 
-
 # ══════════════════════════════════════════════════════════
-# CHUNKER — splits large text into 1800-char chunks
+# CHUNKER
 # ══════════════════════════════════════════════════════════
 def chunk_text(text: str, max_chars: int = 1800) -> list[str]:
     sentences = text.split(". ")
@@ -57,48 +79,62 @@ def chunk_text(text: str, max_chars: int = 1800) -> list[str]:
 
     return chunks
 
-
 # ══════════════════════════════════════════════════════════
-# HF SUMMARIZER — hierarchical, preserves detail
+# HF SUMMARIZER
 # ══════════════════════════════════════════════════════════
-async def hf_summarize_chunk(client: httpx.AsyncClient, text: str, max_length: int = 200, min_length: int = 60) -> str:
+async def hf_summarize_chunk(
+    client: httpx.AsyncClient,
+    text: str,
+    max_length: int = 200,
+    min_length: int = 60
+) -> str:
     headers = {
         "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type":  "application/json"
     }
     payload = {
         "inputs": text,
         "parameters": {
             "max_length": max_length,
             "min_length": min_length,
-            "do_sample": False
+            "do_sample":  False
         }
     }
 
     response = await client.post(HF_API_URL, headers=headers, json=payload)
 
     if response.status_code == 503:
-        raise HTTPException(status_code=503, detail="Model is loading, retry in 20 seconds.")
+        raise HTTPException(
+            status_code=503,
+            detail="Model is loading, retry in 20 seconds."
+        )
     if response.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"HF API error {response.status_code}: {response.text}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"HF API error {response.status_code}: {response.text}"
+        )
 
     result = response.json()
     if not result or not isinstance(result, list) or "summary_text" not in result[0]:
-        raise HTTPException(status_code=500, detail=f"Unexpected HF response: {result}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected HF response: {result}"
+        )
 
     return result[0]["summary_text"].strip()
 
-
 # ══════════════════════════════════════════════════════════
-# GROQ SUMMARIZER — replaces HF BART for better quality
+# GROQ SUMMARIZER
 # ══════════════════════════════════════════════════════════
 async def groq_summarize(text: str) -> str:
     MAX_CHARS = 12000
-    chunks_to_summarize = [text] if len(text) <= MAX_CHARS else chunk_text(text, max_chars=MAX_CHARS)
+    chunks_to_summarize = (
+        [text] if len(text) <= MAX_CHARS
+        else chunk_text(text, max_chars=MAX_CHARS)
+    )
     chunk_summaries = []
 
     for chunk in chunks_to_summarize:
-        # ✅ asyncio.to_thread — Groq SDK is sync, must run in thread pool
         response = await asyncio.to_thread(
             groq_client.chat.completions.create,
             model="llama-3.3-70b-versatile",
@@ -129,14 +165,19 @@ async def groq_summarize(text: str) -> str:
     if len(chunk_summaries) == 1:
         return chunk_summaries[0]
 
-    combined = "\n\n".join(f"[Part {i+1}]\n{s}" for i, s in enumerate(chunk_summaries))
+    combined = "\n\n".join(
+        f"[Part {i+1}]\n{s}" for i, s in enumerate(chunk_summaries)
+    )
     final = await asyncio.to_thread(
         groq_client.chat.completions.create,
         model="llama-3.3-70b-versatile",
         messages=[
             {
                 "role": "system",
-                "content": "Merge these partial meeting summaries into one complete, detailed summary. Do not lose any detail."
+                "content": (
+                    "Merge these partial meeting summaries into one "
+                    "complete, detailed summary. Do not lose any detail."
+                )
             },
             {
                 "role": "user",
@@ -147,7 +188,6 @@ async def groq_summarize(text: str) -> str:
         max_tokens=1500,
     )
     return final.choices[0].message.content.strip()
-
 
 # ══════════════════════════════════════════════════════════
 # /signup
@@ -178,7 +218,6 @@ async def signup(data: SignUpRequest):
         token=token
     )
 
-
 # ══════════════════════════════════════════════════════════
 # /login
 # ══════════════════════════════════════════════════════════
@@ -201,6 +240,131 @@ async def login(data: LoginRequest):
         token=token
     )
 
+# ══════════════════════════════════════════════════════════
+# /meetings  →  POST
+# Handles both admin creating and member joining
+# ══════════════════════════════════════════════════════════
+@app.post("/meetings")
+async def handle_meeting(data: MeetingRequest):
+    """
+    Single endpoint for meeting management:
+      - is_admin = true  → Admin creates a new meeting
+      - is_admin = false → Member joins existing meeting
+    """
+
+    room_code = data.room_code.strip().upper()
+    email     = data.email.strip().lower()
+
+    # ── CASE 1: Admin creating a new meeting ──────────────────────
+    if data.is_admin:
+
+        # Check if room already exists
+        existing = meetings_collection.find_one({"room_code": room_code})
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status":  "error",
+                    "message": f"Room '{room_code}' already exists.",
+                    "code":    "ROOM_ALREADY_EXISTS"
+                }
+            )
+
+        # Build meeting document
+        meeting_doc = {
+            "room_code":   room_code,
+            "admin_email": email,
+            "members":     [email],   # admin is first member
+            "created_at":  datetime.now(timezone.utc).isoformat(),
+        }
+
+        try:
+            meetings_collection.insert_one(meeting_doc)
+        except DuplicateKeyError:
+            # Race condition safety
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status":  "error",
+                    "message": f"Room '{room_code}' was just created by another request.",
+                    "code":    "ROOM_ALREADY_EXISTS"
+                }
+            )
+
+        return {
+            "status":     "success",
+            "message":    f"Meeting '{room_code}' created successfully.",
+            "room_code":  room_code,
+            "admin":      email,
+            "members":    [email],
+            "created_at": meeting_doc["created_at"]
+        }
+
+    # ── CASE 2: Member joining existing meeting ───────────────────
+    else:
+
+        # Check room exists
+        existing = meetings_collection.find_one({"room_code": room_code})
+        if not existing:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "status":  "error",
+                    "message": f"Room '{room_code}' does not exist. "
+                               f"Please check the room code.",
+                    "code":    "ROOM_NOT_FOUND"
+                }
+            )
+
+        # $addToSet prevents duplicate emails automatically
+        meetings_collection.update_one(
+            {"room_code": room_code},
+            {"$addToSet": {"members": email}}
+        )
+
+        # Return updated document
+        updated = meetings_collection.find_one(
+            {"room_code": room_code},
+            {"_id": 0}
+        )
+
+        return {
+            "status":     "success",
+            "message":    f"'{email}' joined meeting '{room_code}' successfully.",
+            "room_code":  room_code,
+            "admin":      updated["admin_email"],
+            "members":    updated["members"],
+            "created_at": updated["created_at"]
+        }
+
+# ══════════════════════════════════════════════════════════
+# /meetings/{email}  →  GET
+# Get all meetings for a user by email
+# ══════════════════════════════════════════════════════════
+@app.get("/meetings/{email}")
+async def get_meetings(email: str):
+    """
+    Returns all meetings where this email
+    is either the admin or a member.
+    """
+    email = email.strip().lower()
+
+    meetings = list(
+        meetings_collection.find(
+            {"$or": [
+                {"admin_email": email},
+                {"members":     email}
+            ]},
+            {"_id": 0}
+        ).sort("created_at", -1)  # newest first
+    )
+
+    return {
+        "status":   "success",
+        "email":    email,
+        "count":    len(meetings),
+        "meetings": meetings
+    }
 
 # ══════════════════════════════════════════════════════════
 # /summarize  →  returns summary JSON
@@ -208,42 +372,28 @@ async def login(data: LoginRequest):
 @app.post("/summarize")
 async def summarize(file: UploadFile = File(...)):
     if not file.filename.endswith(".txt"):
-        raise HTTPException(status_code=400, detail="Only .txt files are accepted.")
+        raise HTTPException(
+            status_code=400,
+            detail="Only .txt files are accepted."
+        )
 
     raw = await file.read()
 
     try:
         text = raw.decode("utf-8").strip()
     except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="File must be UTF-8 encoded.")
+        raise HTTPException(
+            status_code=400,
+            detail="File must be UTF-8 encoded."
+        )
 
     if not text:
         raise HTTPException(status_code=400, detail="File is empty.")
 
     cleaned = clean_text(text)
-    summary = await groq_summarize(cleaned)   # ← changed from hf_summarize
+    summary = await groq_summarize(cleaned)
 
     return {"summary": summary}
-
-
-# ══════════════════════════════════════════════════════════
-# /debug-token  →  remove after confirming token works
-# ══════════════════════════════════════════════════════════
-@app.get("/debug-token")
-def debug_token():
-    return {
-        "token_set": HF_API_TOKEN is not None,
-        "token_preview": HF_API_TOKEN[:8] if HF_API_TOKEN else "MISSING"
-    }
-
-
-# ══════════════════════════════════════════════════════════
-# Health check
-# ══════════════════════════════════════════════════════════
-@app.get("/")
-def root():
-    return {"status": "MeetAI API is running."}
-
 
 # ══════════════════════════════════════════════════════════
 # /transcribe  →  accepts audio, returns .txt file
@@ -256,13 +406,16 @@ async def transcribe(file: UploadFile = File(...)):
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            detail=f"Unsupported file type '{suffix}'. "
+                   f"Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
         )
 
-    # Groq has a 25MB file size limit
     contents = await file.read()
     if len(contents) > 25 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File too large. Max size is 25MB.")
+        raise HTTPException(
+            status_code=400,
+            detail="File too large. Max size is 25MB."
+        )
 
     try:
         transcription = groq_client.audio.transcriptions.create(
@@ -271,7 +424,10 @@ async def transcribe(file: UploadFile = File(...)):
             response_format="text"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Transcription failed: {str(e)}"
+        )
 
     txt_filename = Path(file.filename).stem + "_transcript.txt"
     return Response(
@@ -279,3 +435,20 @@ async def transcribe(file: UploadFile = File(...)):
         media_type="text/plain",
         headers={"Content-Disposition": f"attachment; filename={txt_filename}"}
     )
+
+# ══════════════════════════════════════════════════════════
+# /debug-token
+# ══════════════════════════════════════════════════════════
+@app.get("/debug-token")
+def debug_token():
+    return {
+        "token_set":     HF_API_TOKEN is not None,
+        "token_preview": HF_API_TOKEN[:8] if HF_API_TOKEN else "MISSING"
+    }
+
+# ══════════════════════════════════════════════════════════
+# Health check
+# ══════════════════════════════════════════════════════════
+@app.get("/")
+def root():
+    return {"status": "MeetAI API is running."}
