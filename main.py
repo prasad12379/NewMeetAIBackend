@@ -17,10 +17,8 @@ from datetime import datetime, timezone
 from typing import Optional, List
 import smtplib
 import base64
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+
+import resend
 
 load_dotenv()
 
@@ -167,6 +165,9 @@ async def groq_summarize(text: str) -> str:
 # ══════════════════════════════════════════════════════════
 # SMTP email sender — runs in thread pool (non-blocking)
 # ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# RESEND email sender — runs in thread pool (non-blocking)
+# ══════════════════════════════════════════════════════════
 def send_emails_sync(
     members:      List[str],
     pdf_bytes:    bytes,
@@ -176,66 +177,80 @@ def send_emails_sync(
     admin_email:  str
 ) -> dict:
     """
-    Pure synchronous function — safe to run in asyncio.to_thread().
-    Connects once, sends to all members, returns result dict.
+    Sends PDF to all members via Resend API.
+    Runs in asyncio.to_thread() to avoid blocking FastAPI.
     """
     failed  = []
     success = []
 
-    try:
-        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+    # Encode PDF to base64 for Resend attachment
+    pdf_base64_str = base64.b64encode(pdf_bytes).decode("utf-8")
 
-        for member_email in members:
-            try:
-                msg            = MIMEMultipart()
-                msg["From"]    = SMTP_EMAIL
-                msg["To"]      = member_email
-                msg["Subject"] = f"MeetAI — Meeting Summary [{room_code}]"
+    for member_email in members:
+        try:
+            body_html = f"""
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                <div style="background: #0D0D1A; padding: 30px; border-radius: 12px;">
+                    <h2 style="color: #2ACFD9; margin-bottom: 8px;">
+                        MeetAI — Meeting Summary
+                    </h2>
+                    <hr style="border-color: #2ACFD9; margin-bottom: 20px;">
 
-                body = (
-                    f"Hi,\n\n"
-                    f"Please find attached the AI-generated summary "
-                    f"for your recent MeetAI meeting.\n\n"
-                    f"Meeting Details:\n"
-                    f"  • Room Code : {room_code}\n"
-                    f"  • Duration  : {duration}\n"
-                    f"  • Admin     : {admin_email}\n\n"
-                    f"The full meeting summary is attached as a PDF.\n\n"
-                    f"Best regards,\n"
-                    f"MeetAI Team"
-                )
-                msg.attach(MIMEText(body, "plain"))
+                    <p style="color: #CCCCCC;">Hi,</p>
+                    <p style="color: #CCCCCC;">
+                        Please find attached the AI-generated summary
+                        for your recent MeetAI meeting.
+                    </p>
 
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(pdf_bytes)
-                encoders.encode_base64(part)
-                part.add_header(
-                    "Content-Disposition",
-                    f'attachment; filename="{pdf_filename}"'
-                )
-                msg.attach(part)
+                    <div style="background: #1A1A2E; border-radius: 8px;
+                                padding: 16px; margin: 20px 0;">
+                        <p style="color: #888888; margin: 0 0 8px 0;
+                                  font-size: 12px; letter-spacing: 1px;">
+                            MEETING DETAILS
+                        </p>
+                        <p style="color: #2ACFD9; margin: 4px 0;">
+                            🏠 Room Code: <strong>{room_code}</strong>
+                        </p>
+                        <p style="color: #FFC107; margin: 4px 0;">
+                            ⏱ Duration: <strong>{duration}</strong>
+                        </p>
+                        <p style="color: #A855F7; margin: 4px 0;">
+                            👤 Admin: <strong>{admin_email}</strong>
+                        </p>
+                    </div>
 
-                server.sendmail(SMTP_EMAIL, member_email, msg.as_string())
-                success.append(member_email)
-                print(f"✅ Email sent to {member_email}")
+                    <p style="color: #CCCCCC;">
+                        The full meeting summary is attached as a PDF.
+                    </p>
 
-            except Exception as e:
-                print(f"❌ Failed to send to {member_email}: {e}")
-                failed.append({"email": member_email, "error": str(e)})
+                    <hr style="border-color: #333333; margin-top: 20px;">
+                    <p style="color: #555555; font-size: 12px;">
+                        Sent by MeetAI • Powered by AI
+                    </p>
+                </div>
+            </div>
+            """
 
-        server.quit()
+            params = {
+                "from":    "MeetAI <onboarding@resend.dev>",  # use this until you verify domain
+                "to":      [member_email],
+                "subject": f"MeetAI — Meeting Summary [{room_code}]",
+                "html":    body_html,
+                "attachments": [
+                    {
+                        "filename": pdf_filename,
+                        "content":  pdf_base64_str,
+                    }
+                ]
+            }
 
-    except smtplib.SMTPAuthenticationError:
-        raise Exception(
-            "Gmail authentication failed. "
-            "Check SMTP_EMAIL and SMTP_PASSWORD (use App Password, not your Gmail password)."
-        )
-    except Exception as e:
-        raise Exception(f"SMTP connection failed: {str(e)}")
+            response = resend.Emails.send(params)
+            print(f"✅ Email sent to {member_email} | ID: {response.get('id', 'N/A')}")
+            success.append(member_email)
+
+        except Exception as e:
+            print(f"❌ Failed to send to {member_email}: {e}")
+            failed.append({"email": member_email, "error": str(e)})
 
     return {
         "success": success,
@@ -470,14 +485,17 @@ async def transcribe(file: UploadFile = File(...)):
 # ══════════════════════════════════════════════════════════
 # /send-summary  →  sends PDF to all meeting members
 # ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# /send-summary  →  sends PDF to all meeting members
+# ══════════════════════════════════════════════════════════
 @app.post("/send-summary")
 async def send_summary(data: SendSummaryRequest):
 
-    # ── Validate credentials ──────────────────────────────────────
-    if not SMTP_EMAIL or not SMTP_PASSWORD:
+    # ── Validate Resend API key ───────────────────────────────────
+    if not RESEND_API_KEY:
         raise HTTPException(
             status_code=500,
-            detail="Email credentials not configured. Add SMTP_EMAIL and SMTP_PASSWORD to environment variables."
+            detail="RESEND_API_KEY not configured. Add it to environment variables."
         )
 
     if not data.members:
@@ -487,18 +505,23 @@ async def send_summary(data: SendSummaryRequest):
     try:
         pdf_bytes = base64.b64decode(data.pdf_base64)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid PDF base64 data: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid PDF base64 data: {str(e)}"
+        )
 
     if len(pdf_bytes) < 100:
-        raise HTTPException(status_code=400, detail="PDF data appears to be empty or corrupted.")
-
-    print(f"📧 Sending summary to {len(data.members)} member(s): {data.members}")
-    print(f"📄 PDF size: {len(pdf_bytes)} bytes")
-    print(f"📬 SMTP_EMAIL configured: {SMTP_EMAIL}")
+        raise HTTPException(
+            status_code=400,
+            detail="PDF data appears to be empty or corrupted."
+        )
 
     pdf_filename = f"Summary_{data.room_code}.pdf"
 
-    # ── Send emails in thread pool so we don't block FastAPI ──────
+    print(f"📧 Sending to {len(data.members)} member(s): {data.members}")
+    print(f"📄 PDF size: {len(pdf_bytes)} bytes")
+
+    # ── Send in thread pool (non-blocking) ───────────────────────
     try:
         result = await asyncio.to_thread(
             send_emails_sync,
@@ -510,14 +533,11 @@ async def send_summary(data: SendSummaryRequest):
             data.admin_email
         )
     except Exception as e:
-        print(f"❌ Email sending failed: {e}")
+        print(f"❌ Email sending error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     success = result["success"]
     failed  = result["failed"]
-
-    print(f"✅ Sent: {success}")
-    print(f"❌ Failed: {failed}")
 
     return {
         "status":       "success" if not failed else "partial",
@@ -526,7 +546,6 @@ async def send_summary(data: SendSummaryRequest):
         "total_sent":   len(success),
         "total_failed": len(failed)
     }
-
 # ══════════════════════════════════════════════════════════
 # Health check
 # ══════════════════════════════════════════════════════════
