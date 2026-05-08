@@ -29,7 +29,7 @@ app = FastAPI(title="MeetAI Auth API")
 # ══════════════════════════════════════════════════════════
 # MongoDB — Meetings Collection
 # ══════════════════════════════════════════════════════════
-MONGO_URI          = os.getenv("MONGO_URI", "your_mongodb_connection_string")
+MONGO_URI = os.getenv("MONGO_URL")
 meetings_client     = MongoClient(MONGO_URI)
 meetings_db         = meetings_client["meetai"]
 meetings_collection = meetings_db["Meetings"]
