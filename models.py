@@ -24,3 +24,4 @@ class AuthResponse(BaseModel):
     message: Optional[str] = None
     user: Optional[User] = None
     token: Optional[str] = None
+

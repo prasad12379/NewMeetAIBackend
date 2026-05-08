@@ -17,9 +17,19 @@ from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel
 from datetime import datetime, timezone
 from typing import Optional
+import smtplib
+import base64
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+from pydantic import BaseModel
+from typing import List
 
 load_dotenv()
 
+SMTP_EMAIL    = os.getenv("SMTP_EMAIL")     # your gmail
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD") 
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 groq_client  = Groq(api_key=os.getenv("GROQ_API_KEY"))
 HF_API_URL   = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
@@ -44,6 +54,14 @@ class MeetingRequest(BaseModel):
     room_code: str
     email:     str
     is_admin:  bool
+
+
+class SendSummaryRequest(BaseModel):
+    room_code:   str
+    duration:    str
+    members:     List[str]        # list of member emails
+    pdf_base64:  str              # PDF file encoded as base64 string
+    admin_email: str
 
 # ══════════════════════════════════════════════════════════
 # TEXT CLEANER
@@ -437,14 +455,99 @@ async def transcribe(file: UploadFile = File(...)):
     )
 
 # ══════════════════════════════════════════════════════════
-# /debug-token
+# /send-summary  →  sends PDF to all meeting members
 # ══════════════════════════════════════════════════════════
-@app.get("/debug-token")
-def debug_token():
+@app.post("/send-summary")
+async def send_summary(data: SendSummaryRequest):
+    if not SMTP_EMAIL or not SMTP_PASSWORD:
+        raise HTTPException(
+            status_code=500,
+            detail="Email credentials not configured on server."
+        )
+
+    if not data.members:
+        raise HTTPException(
+            status_code=400,
+            detail="No members to send to."
+        )
+
+    # Decode base64 PDF
+    try:
+        pdf_bytes = base64.b64decode(data.pdf_base64)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid PDF data: {str(e)}"
+        )
+
+    pdf_filename = f"Summary_{data.room_code}.pdf"
+    failed       = []
+    success      = []
+
+    try:
+        # Connect to Gmail SMTP once, send to all members
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+
+        for member_email in data.members:
+            try:
+                msg = MIMEMultipart()
+                msg["From"]    = SMTP_EMAIL
+                msg["To"]      = member_email
+                msg["Subject"] = f"MeetAI — Meeting Summary [{data.room_code}]"
+
+                # Email body
+                body = f"""
+Hi,
+
+Please find attached the AI-generated summary for your recent MeetAI meeting.
+
+Meeting Details:
+  • Room Code : {data.room_code}
+  • Duration  : {data.duration}
+  • Admin     : {data.admin_email}
+
+The full meeting summary is attached as a PDF.
+
+Best regards,
+MeetAI Team
+                """.strip()
+
+                msg.attach(MIMEText(body, "plain"))
+
+                # Attach PDF
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(pdf_bytes)
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition",
+                    f"attachment; filename={pdf_filename}"
+                )
+                msg.attach(part)
+
+                server.sendmail(SMTP_EMAIL, member_email, msg.as_string())
+                success.append(member_email)
+
+            except Exception as e:
+                failed.append({"email": member_email, "error": str(e)})
+
+        server.quit()
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"SMTP connection failed: {str(e)}"
+        )
+
     return {
-        "token_set":     HF_API_TOKEN is not None,
-        "token_preview": HF_API_TOKEN[:8] if HF_API_TOKEN else "MISSING"
+        "status":        "success" if not failed else "partial",
+        "sent_to":       success,
+        "failed":        failed,
+        "total_sent":    len(success),
+        "total_failed":  len(failed)
     }
+
 
 # ══════════════════════════════════════════════════════════
 # Health check
