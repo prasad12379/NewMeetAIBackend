@@ -22,11 +22,11 @@ import resend
 
 load_dotenv()
 
-SMTP_EMAIL    = os.getenv("SMTP_EMAIL")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+
 HF_API_TOKEN  = os.getenv("HF_API_TOKEN")
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY")
 MONGO_URL     = os.getenv("MONGO_URL")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 HF_API_URL  = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
