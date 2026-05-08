@@ -31,7 +31,7 @@ app = FastAPI(title="MeetAI Auth API")
 # ══════════════════════════════════════════════════════════
 MONGO_URI = os.getenv("MONGO_URL")
 meetings_client     = MongoClient(MONGO_URI)
-meetings_db         = meetings_client["meetai"]
+meetings_db         = meetings_client["MeetAIdb"]
 meetings_collection = meetings_db["Meetings"]
 
 # Unique index on room_code — prevents duplicate rooms at DB level
