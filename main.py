@@ -14,19 +14,13 @@ from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel
 from datetime import datetime, timezone
-from typing import Optional, List
-import smtplib
-import base64
-
-import resend
+from typing import List
 
 load_dotenv()
 
-
-HF_API_TOKEN  = os.getenv("HF_API_TOKEN")
-GROQ_API_KEY  = os.getenv("GROQ_API_KEY")
-MONGO_URL     = os.getenv("MONGO_URL")
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MONGO_URL    = os.getenv("MONGO_URL")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 HF_API_URL  = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
@@ -60,13 +54,6 @@ class MeetingRequest(BaseModel):
     room_code: str
     email:     str
     is_admin:  bool
-
-class SendSummaryRequest(BaseModel):
-    room_code:   str
-    duration:    str
-    members:     List[str]
-    pdf_base64:  str
-    admin_email: str
 
 # ══════════════════════════════════════════════════════════
 # TEXT CLEANER
@@ -163,101 +150,6 @@ async def groq_summarize(text: str) -> str:
     return final.choices[0].message.content.strip()
 
 # ══════════════════════════════════════════════════════════
-# SMTP email sender — runs in thread pool (non-blocking)
-# ══════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════
-# RESEND email sender — runs in thread pool (non-blocking)
-# ══════════════════════════════════════════════════════════
-def send_emails_sync(
-    members:      List[str],
-    pdf_bytes:    bytes,
-    pdf_filename: str,
-    room_code:    str,
-    duration:     str,
-    admin_email:  str
-) -> dict:
-    """
-    Sends PDF to all members via Resend API.
-    Runs in asyncio.to_thread() to avoid blocking FastAPI.
-    """
-    failed  = []
-    success = []
-
-    # Encode PDF to base64 for Resend attachment
-    pdf_base64_str = base64.b64encode(pdf_bytes).decode("utf-8")
-
-    for member_email in members:
-        try:
-            body_html = f"""
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-                <div style="background: #0D0D1A; padding: 30px; border-radius: 12px;">
-                    <h2 style="color: #2ACFD9; margin-bottom: 8px;">
-                        MeetAI — Meeting Summary
-                    </h2>
-                    <hr style="border-color: #2ACFD9; margin-bottom: 20px;">
-
-                    <p style="color: #CCCCCC;">Hi,</p>
-                    <p style="color: #CCCCCC;">
-                        Please find attached the AI-generated summary
-                        for your recent MeetAI meeting.
-                    </p>
-
-                    <div style="background: #1A1A2E; border-radius: 8px;
-                                padding: 16px; margin: 20px 0;">
-                        <p style="color: #888888; margin: 0 0 8px 0;
-                                  font-size: 12px; letter-spacing: 1px;">
-                            MEETING DETAILS
-                        </p>
-                        <p style="color: #2ACFD9; margin: 4px 0;">
-                            🏠 Room Code: <strong>{room_code}</strong>
-                        </p>
-                        <p style="color: #FFC107; margin: 4px 0;">
-                            ⏱ Duration: <strong>{duration}</strong>
-                        </p>
-                        <p style="color: #A855F7; margin: 4px 0;">
-                            👤 Admin: <strong>{admin_email}</strong>
-                        </p>
-                    </div>
-
-                    <p style="color: #CCCCCC;">
-                        The full meeting summary is attached as a PDF.
-                    </p>
-
-                    <hr style="border-color: #333333; margin-top: 20px;">
-                    <p style="color: #555555; font-size: 12px;">
-                        Sent by MeetAI • Powered by AI
-                    </p>
-                </div>
-            </div>
-            """
-
-            params = {
-                "from":    "MeetAI <onboarding@resend.dev>",  # use this until you verify domain
-                "to":      [member_email],
-                "subject": f"MeetAI — Meeting Summary [{room_code}]",
-                "html":    body_html,
-                "attachments": [
-                    {
-                        "filename": pdf_filename,
-                        "content":  pdf_base64_str,
-                    }
-                ]
-            }
-
-            response = resend.Emails.send(params)
-            print(f"✅ Email sent to {member_email} | ID: {response.get('id', 'N/A')}")
-            success.append(member_email)
-
-        except Exception as e:
-            print(f"❌ Failed to send to {member_email}: {e}")
-            failed.append({"email": member_email, "error": str(e)})
-
-    return {
-        "success": success,
-        "failed":  failed
-    }
-
-# ══════════════════════════════════════════════════════════
 # /signup
 # ══════════════════════════════════════════════════════════
 @app.post("/signup", response_model=AuthResponse)
@@ -310,6 +202,7 @@ async def login(data: LoginRequest):
 
 # ══════════════════════════════════════════════════════════
 # /meetings  →  POST
+# Handles both admin creating and member joining
 # ══════════════════════════════════════════════════════════
 @app.post("/meetings")
 async def handle_meeting(data: MeetingRequest):
@@ -371,7 +264,8 @@ async def handle_meeting(data: MeetingRequest):
             {"room_code": room_code},
             {"$addToSet": {"members": email}}
         )
-        updated = meetings_collection.find_one({"room_code": room_code}, {"_id": 0})
+        updated = meetings_collection.find_one(
+            {"room_code": room_code}, {"_id": 0})
         return {
             "status":     "success",
             "message":    f"'{email}' joined meeting '{room_code}' successfully.",
@@ -383,6 +277,7 @@ async def handle_meeting(data: MeetingRequest):
 
 # ══════════════════════════════════════════════════════════
 # /meetings/{email}  →  GET
+# Get all meetings for a user by email
 # ══════════════════════════════════════════════════════════
 @app.get("/meetings/{email}")
 async def get_meetings(email: str):
@@ -405,6 +300,7 @@ async def get_meetings(email: str):
 
 # ══════════════════════════════════════════════════════════
 # /meetings/{room_code}/members  →  GET
+# Get members list for a specific room code
 # ══════════════════════════════════════════════════════════
 @app.get("/meetings/{room_code}/members")
 async def get_meeting_members(room_code: str):
@@ -433,13 +329,19 @@ async def get_meeting_members(room_code: str):
 @app.post("/summarize")
 async def summarize(file: UploadFile = File(...)):
     if not file.filename.endswith(".txt"):
-        raise HTTPException(status_code=400, detail="Only .txt files are accepted.")
+        raise HTTPException(
+            status_code=400,
+            detail="Only .txt files are accepted."
+        )
 
     raw = await file.read()
     try:
         text = raw.decode("utf-8").strip()
     except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="File must be UTF-8 encoded.")
+        raise HTTPException(
+            status_code=400,
+            detail="File must be UTF-8 encoded."
+        )
 
     if not text:
         raise HTTPException(status_code=400, detail="File is empty.")
@@ -459,12 +361,16 @@ async def transcribe(file: UploadFile = File(...)):
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            detail=f"Unsupported file type '{suffix}'. "
+                   f"Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
         )
 
     contents = await file.read()
     if len(contents) > 25 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File too large. Max size is 25MB.")
+        raise HTTPException(
+            status_code=400,
+            detail="File too large. Max size is 25MB."
+        )
 
     try:
         transcription = groq_client.audio.transcriptions.create(
@@ -473,7 +379,10 @@ async def transcribe(file: UploadFile = File(...)):
             response_format="text"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Transcription failed: {str(e)}"
+        )
 
     txt_filename = Path(file.filename).stem + "_transcript.txt"
     return Response(
@@ -483,77 +392,12 @@ async def transcribe(file: UploadFile = File(...)):
     )
 
 # ══════════════════════════════════════════════════════════
-# /send-summary  →  sends PDF to all meeting members
-# ══════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════
-# /send-summary  →  sends PDF to all meeting members
-# ══════════════════════════════════════════════════════════
-@app.post("/send-summary")
-async def send_summary(data: SendSummaryRequest):
-
-    # ── Validate Resend API key ───────────────────────────────────
-    if not RESEND_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="RESEND_API_KEY not configured. Add it to environment variables."
-        )
-
-    if not data.members:
-        raise HTTPException(status_code=400, detail="No members to send to.")
-
-    # ── Decode PDF ────────────────────────────────────────────────
-    try:
-        pdf_bytes = base64.b64decode(data.pdf_base64)
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid PDF base64 data: {str(e)}"
-        )
-
-    if len(pdf_bytes) < 100:
-        raise HTTPException(
-            status_code=400,
-            detail="PDF data appears to be empty or corrupted."
-        )
-
-    pdf_filename = f"Summary_{data.room_code}.pdf"
-
-    print(f"📧 Sending to {len(data.members)} member(s): {data.members}")
-    print(f"📄 PDF size: {len(pdf_bytes)} bytes")
-
-    # ── Send in thread pool (non-blocking) ───────────────────────
-    try:
-        result = await asyncio.to_thread(
-            send_emails_sync,
-            data.members,
-            pdf_bytes,
-            pdf_filename,
-            data.room_code,
-            data.duration,
-            data.admin_email
-        )
-    except Exception as e:
-        print(f"❌ Email sending error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    success = result["success"]
-    failed  = result["failed"]
-
-    return {
-        "status":       "success" if not failed else "partial",
-        "sent_to":      success,
-        "failed":       failed,
-        "total_sent":   len(success),
-        "total_failed": len(failed)
-    }
-# ══════════════════════════════════════════════════════════
 # Health check
 # ══════════════════════════════════════════════════════════
 @app.get("/")
 def root():
     return {
-        "status":       "MeetAI API is running.",
-        "smtp_email":   SMTP_EMAIL or "NOT SET",
-        "mongo_url":    "SET" if MONGO_URL else "NOT SET",
-        "groq_key":     "SET" if GROQ_API_KEY else "NOT SET"
+        "status":    "MeetAI API is running.",
+        "mongo_url": "SET" if MONGO_URL else "NOT SET",
+        "groq_key":  "SET" if GROQ_API_KEY else "NOT SET"
     }
