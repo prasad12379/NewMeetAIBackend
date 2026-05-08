@@ -7,60 +7,67 @@ from models import SignUpRequest, LoginRequest, AuthResponse, User
 from database import users_collection as user_collection
 from utils.auth import hash_password, verify_password, create_token
 import asyncio
-import tempfile
-import shutil
 from pathlib import Path
 from groq import Groq
 from fastapi.responses import Response
-from pymongo import MongoClient, ASCENDING
+from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 import smtplib
 import base64
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from pydantic import BaseModel
-from typing import List
 
 load_dotenv()
 
-SMTP_EMAIL    = os.getenv("SMTP_EMAIL")     # your gmail
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD") 
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
-groq_client  = Groq(api_key=os.getenv("GROQ_API_KEY"))
-HF_API_URL   = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
+SMTP_EMAIL    = os.getenv("SMTP_EMAIL")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+HF_API_TOKEN  = os.getenv("HF_API_TOKEN")
+GROQ_API_KEY  = os.getenv("GROQ_API_KEY")
+MONGO_URL     = os.getenv("MONGO_URL")
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+HF_API_URL  = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
 
 app = FastAPI(title="MeetAI Auth API")
 
 # ══════════════════════════════════════════════════════════
-# MongoDB — Meetings Collection
+# MongoDB — lazy init on startup event
 # ══════════════════════════════════════════════════════════
-MONGO_URI = os.getenv("MONGO_URL")
-meetings_client     = MongoClient(MONGO_URI)
-meetings_db         = meetings_client["MeetAIdb"]
-meetings_collection = meetings_db["Meetings"]
+meetings_collection = None
 
-# Unique index on room_code — prevents duplicate rooms at DB level
-meetings_collection.create_index("room_code", unique=True)
+@app.on_event("startup")
+async def startup_db():
+    global meetings_collection
+    if not MONGO_URL:
+        raise RuntimeError("MONGO_URL environment variable is not set.")
+    try:
+        meetings_client     = MongoClient(MONGO_URL, serverSelectionTimeoutMS=10000)
+        meetings_db         = meetings_client["MeetAIdb"]
+        meetings_collection = meetings_db["Meetings"]
+        meetings_collection.create_index("room_code", unique=True)
+        print("✅ MongoDB connected successfully.")
+    except Exception as e:
+        print(f"❌ MongoDB connection failed: {e}")
+        raise RuntimeError(f"MongoDB connection failed: {e}")
 
 # ══════════════════════════════════════════════════════════
-# Pydantic Model — /meetings
+# Pydantic Models
 # ══════════════════════════════════════════════════════════
 class MeetingRequest(BaseModel):
     room_code: str
     email:     str
     is_admin:  bool
 
-
 class SendSummaryRequest(BaseModel):
     room_code:   str
     duration:    str
-    members:     List[str]        # list of member emails
-    pdf_base64:  str              # PDF file encoded as base64 string
+    members:     List[str]
+    pdf_base64:  str
     admin_email: str
 
 # ══════════════════════════════════════════════════════════
@@ -83,7 +90,6 @@ def clean_text(text: str) -> str:
 def chunk_text(text: str, max_chars: int = 1800) -> list[str]:
     sentences = text.split(". ")
     chunks, current = [], ""
-
     for sentence in sentences:
         if len(current) + len(sentence) < max_chars:
             current += sentence + ". "
@@ -91,55 +97,9 @@ def chunk_text(text: str, max_chars: int = 1800) -> list[str]:
             if current:
                 chunks.append(current.strip())
             current = sentence + ". "
-
     if current:
         chunks.append(current.strip())
-
     return chunks
-
-# ══════════════════════════════════════════════════════════
-# HF SUMMARIZER
-# ══════════════════════════════════════════════════════════
-async def hf_summarize_chunk(
-    client: httpx.AsyncClient,
-    text: str,
-    max_length: int = 200,
-    min_length: int = 60
-) -> str:
-    headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Content-Type":  "application/json"
-    }
-    payload = {
-        "inputs": text,
-        "parameters": {
-            "max_length": max_length,
-            "min_length": min_length,
-            "do_sample":  False
-        }
-    }
-
-    response = await client.post(HF_API_URL, headers=headers, json=payload)
-
-    if response.status_code == 503:
-        raise HTTPException(
-            status_code=503,
-            detail="Model is loading, retry in 20 seconds."
-        )
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=500,
-            detail=f"HF API error {response.status_code}: {response.text}"
-        )
-
-    result = response.json()
-    if not result or not isinstance(result, list) or "summary_text" not in result[0]:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected HF response: {result}"
-        )
-
-    return result[0]["summary_text"].strip()
 
 # ══════════════════════════════════════════════════════════
 # GROQ SUMMARIZER
@@ -191,14 +151,11 @@ async def groq_summarize(text: str) -> str:
         model="llama-3.3-70b-versatile",
         messages=[
             {
-                "role": "system",
-                "content": (
-                    "Merge these partial meeting summaries into one "
-                    "complete, detailed summary. Do not lose any detail."
-                )
+                "role":    "system",
+                "content": "Merge these partial meeting summaries into one complete, detailed summary. Do not lose any detail."
             },
             {
-                "role": "user",
+                "role":    "user",
                 "content": f"Merge:\n\n{combined}"
             }
         ],
@@ -206,6 +163,84 @@ async def groq_summarize(text: str) -> str:
         max_tokens=1500,
     )
     return final.choices[0].message.content.strip()
+
+# ══════════════════════════════════════════════════════════
+# SMTP email sender — runs in thread pool (non-blocking)
+# ══════════════════════════════════════════════════════════
+def send_emails_sync(
+    members:      List[str],
+    pdf_bytes:    bytes,
+    pdf_filename: str,
+    room_code:    str,
+    duration:     str,
+    admin_email:  str
+) -> dict:
+    """
+    Pure synchronous function — safe to run in asyncio.to_thread().
+    Connects once, sends to all members, returns result dict.
+    """
+    failed  = []
+    success = []
+
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+
+        for member_email in members:
+            try:
+                msg            = MIMEMultipart()
+                msg["From"]    = SMTP_EMAIL
+                msg["To"]      = member_email
+                msg["Subject"] = f"MeetAI — Meeting Summary [{room_code}]"
+
+                body = (
+                    f"Hi,\n\n"
+                    f"Please find attached the AI-generated summary "
+                    f"for your recent MeetAI meeting.\n\n"
+                    f"Meeting Details:\n"
+                    f"  • Room Code : {room_code}\n"
+                    f"  • Duration  : {duration}\n"
+                    f"  • Admin     : {admin_email}\n\n"
+                    f"The full meeting summary is attached as a PDF.\n\n"
+                    f"Best regards,\n"
+                    f"MeetAI Team"
+                )
+                msg.attach(MIMEText(body, "plain"))
+
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(pdf_bytes)
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{pdf_filename}"'
+                )
+                msg.attach(part)
+
+                server.sendmail(SMTP_EMAIL, member_email, msg.as_string())
+                success.append(member_email)
+                print(f"✅ Email sent to {member_email}")
+
+            except Exception as e:
+                print(f"❌ Failed to send to {member_email}: {e}")
+                failed.append({"email": member_email, "error": str(e)})
+
+        server.quit()
+
+    except smtplib.SMTPAuthenticationError:
+        raise Exception(
+            "Gmail authentication failed. "
+            "Check SMTP_EMAIL and SMTP_PASSWORD (use App Password, not your Gmail password)."
+        )
+    except Exception as e:
+        raise Exception(f"SMTP connection failed: {str(e)}")
+
+    return {
+        "success": success,
+        "failed":  failed
+    }
 
 # ══════════════════════════════════════════════════════════
 # /signup
@@ -260,23 +295,16 @@ async def login(data: LoginRequest):
 
 # ══════════════════════════════════════════════════════════
 # /meetings  →  POST
-# Handles both admin creating and member joining
 # ══════════════════════════════════════════════════════════
 @app.post("/meetings")
 async def handle_meeting(data: MeetingRequest):
-    """
-    Single endpoint for meeting management:
-      - is_admin = true  → Admin creates a new meeting
-      - is_admin = false → Member joins existing meeting
-    """
+    if meetings_collection is None:
+        raise HTTPException(status_code=503, detail="Database not connected.")
 
     room_code = data.room_code.strip().upper()
     email     = data.email.strip().lower()
 
-    # ── CASE 1: Admin creating a new meeting ──────────────────────
     if data.is_admin:
-
-        # Check if room already exists
         existing = meetings_collection.find_one({"room_code": room_code})
         if existing:
             raise HTTPException(
@@ -287,19 +315,15 @@ async def handle_meeting(data: MeetingRequest):
                     "code":    "ROOM_ALREADY_EXISTS"
                 }
             )
-
-        # Build meeting document
         meeting_doc = {
             "room_code":   room_code,
             "admin_email": email,
-            "members":     [email],   # admin is first member
+            "members":     [email],
             "created_at":  datetime.now(timezone.utc).isoformat(),
         }
-
         try:
             meetings_collection.insert_one(meeting_doc)
         except DuplicateKeyError:
-            # Race condition safety
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -308,7 +332,6 @@ async def handle_meeting(data: MeetingRequest):
                     "code":    "ROOM_ALREADY_EXISTS"
                 }
             )
-
         return {
             "status":     "success",
             "message":    f"Meeting '{room_code}' created successfully.",
@@ -318,34 +341,22 @@ async def handle_meeting(data: MeetingRequest):
             "created_at": meeting_doc["created_at"]
         }
 
-    # ── CASE 2: Member joining existing meeting ───────────────────
     else:
-
-        # Check room exists
         existing = meetings_collection.find_one({"room_code": room_code})
         if not existing:
             raise HTTPException(
                 status_code=404,
                 detail={
                     "status":  "error",
-                    "message": f"Room '{room_code}' does not exist. "
-                               f"Please check the room code.",
+                    "message": f"Room '{room_code}' does not exist.",
                     "code":    "ROOM_NOT_FOUND"
                 }
             )
-
-        # $addToSet prevents duplicate emails automatically
         meetings_collection.update_one(
             {"room_code": room_code},
             {"$addToSet": {"members": email}}
         )
-
-        # Return updated document
-        updated = meetings_collection.find_one(
-            {"room_code": room_code},
-            {"_id": 0}
-        )
-
+        updated = meetings_collection.find_one({"room_code": room_code}, {"_id": 0})
         return {
             "status":     "success",
             "message":    f"'{email}' joined meeting '{room_code}' successfully.",
@@ -357,26 +368,19 @@ async def handle_meeting(data: MeetingRequest):
 
 # ══════════════════════════════════════════════════════════
 # /meetings/{email}  →  GET
-# Get all meetings for a user by email
 # ══════════════════════════════════════════════════════════
 @app.get("/meetings/{email}")
 async def get_meetings(email: str):
-    """
-    Returns all meetings where this email
-    is either the admin or a member.
-    """
-    email = email.strip().lower()
+    if meetings_collection is None:
+        raise HTTPException(status_code=503, detail="Database not connected.")
 
+    email    = email.strip().lower()
     meetings = list(
         meetings_collection.find(
-            {"$or": [
-                {"admin_email": email},
-                {"members":     email}
-            ]},
+            {"$or": [{"admin_email": email}, {"members": email}]},
             {"_id": 0}
-        ).sort("created_at", -1)  # newest first
+        ).sort("created_at", -1)
     )
-
     return {
         "status":   "success",
         "email":    email,
@@ -385,32 +389,48 @@ async def get_meetings(email: str):
     }
 
 # ══════════════════════════════════════════════════════════
+# /meetings/{room_code}/members  →  GET
+# ══════════════════════════════════════════════════════════
+@app.get("/meetings/{room_code}/members")
+async def get_meeting_members(room_code: str):
+    if meetings_collection is None:
+        raise HTTPException(status_code=503, detail="Database not connected.")
+
+    room_code = room_code.strip().upper()
+    meeting   = meetings_collection.find_one(
+        {"room_code": room_code},
+        {"_id": 0, "members": 1, "admin_email": 1}
+    )
+    if not meeting:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Meeting '{room_code}' not found."
+        )
+    return {
+        "room_code":   room_code,
+        "admin_email": meeting.get("admin_email", ""),
+        "members":     meeting.get("members", [])
+    }
+
+# ══════════════════════════════════════════════════════════
 # /summarize  →  returns summary JSON
 # ══════════════════════════════════════════════════════════
 @app.post("/summarize")
 async def summarize(file: UploadFile = File(...)):
     if not file.filename.endswith(".txt"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only .txt files are accepted."
-        )
+        raise HTTPException(status_code=400, detail="Only .txt files are accepted.")
 
     raw = await file.read()
-
     try:
         text = raw.decode("utf-8").strip()
     except UnicodeDecodeError:
-        raise HTTPException(
-            status_code=400,
-            detail="File must be UTF-8 encoded."
-        )
+        raise HTTPException(status_code=400, detail="File must be UTF-8 encoded.")
 
     if not text:
         raise HTTPException(status_code=400, detail="File is empty.")
 
     cleaned = clean_text(text)
     summary = await groq_summarize(cleaned)
-
     return {"summary": summary}
 
 # ══════════════════════════════════════════════════════════
@@ -424,16 +444,12 @@ async def transcribe(file: UploadFile = File(...)):
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type '{suffix}'. "
-                   f"Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
         )
 
     contents = await file.read()
     if len(contents) > 25 * 1024 * 1024:
-        raise HTTPException(
-            status_code=400,
-            detail="File too large. Max size is 25MB."
-        )
+        raise HTTPException(status_code=400, detail="File too large. Max size is 25MB.")
 
     try:
         transcription = groq_client.audio.transcriptions.create(
@@ -442,10 +458,7 @@ async def transcribe(file: UploadFile = File(...)):
             response_format="text"
         )
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Transcription failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
     txt_filename = Path(file.filename).stem + "_transcript.txt"
     return Response(
@@ -459,99 +472,69 @@ async def transcribe(file: UploadFile = File(...)):
 # ══════════════════════════════════════════════════════════
 @app.post("/send-summary")
 async def send_summary(data: SendSummaryRequest):
+
+    # ── Validate credentials ──────────────────────────────────────
     if not SMTP_EMAIL or not SMTP_PASSWORD:
         raise HTTPException(
             status_code=500,
-            detail="Email credentials not configured on server."
+            detail="Email credentials not configured. Add SMTP_EMAIL and SMTP_PASSWORD to environment variables."
         )
 
     if not data.members:
-        raise HTTPException(
-            status_code=400,
-            detail="No members to send to."
-        )
+        raise HTTPException(status_code=400, detail="No members to send to.")
 
-    # Decode base64 PDF
+    # ── Decode PDF ────────────────────────────────────────────────
     try:
         pdf_bytes = base64.b64decode(data.pdf_base64)
     except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid PDF data: {str(e)}"
-        )
+        raise HTTPException(status_code=400, detail=f"Invalid PDF base64 data: {str(e)}")
+
+    if len(pdf_bytes) < 100:
+        raise HTTPException(status_code=400, detail="PDF data appears to be empty or corrupted.")
+
+    print(f"📧 Sending summary to {len(data.members)} member(s): {data.members}")
+    print(f"📄 PDF size: {len(pdf_bytes)} bytes")
+    print(f"📬 SMTP_EMAIL configured: {SMTP_EMAIL}")
 
     pdf_filename = f"Summary_{data.room_code}.pdf"
-    failed       = []
-    success      = []
 
+    # ── Send emails in thread pool so we don't block FastAPI ──────
     try:
-        # Connect to Gmail SMTP once, send to all members
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-
-        for member_email in data.members:
-            try:
-                msg = MIMEMultipart()
-                msg["From"]    = SMTP_EMAIL
-                msg["To"]      = member_email
-                msg["Subject"] = f"MeetAI — Meeting Summary [{data.room_code}]"
-
-                # Email body
-                body = f"""
-Hi,
-
-Please find attached the AI-generated summary for your recent MeetAI meeting.
-
-Meeting Details:
-  • Room Code : {data.room_code}
-  • Duration  : {data.duration}
-  • Admin     : {data.admin_email}
-
-The full meeting summary is attached as a PDF.
-
-Best regards,
-MeetAI Team
-                """.strip()
-
-                msg.attach(MIMEText(body, "plain"))
-
-                # Attach PDF
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(pdf_bytes)
-                encoders.encode_base64(part)
-                part.add_header(
-                    "Content-Disposition",
-                    f"attachment; filename={pdf_filename}"
-                )
-                msg.attach(part)
-
-                server.sendmail(SMTP_EMAIL, member_email, msg.as_string())
-                success.append(member_email)
-
-            except Exception as e:
-                failed.append({"email": member_email, "error": str(e)})
-
-        server.quit()
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"SMTP connection failed: {str(e)}"
+        result = await asyncio.to_thread(
+            send_emails_sync,
+            data.members,
+            pdf_bytes,
+            pdf_filename,
+            data.room_code,
+            data.duration,
+            data.admin_email
         )
+    except Exception as e:
+        print(f"❌ Email sending failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    success = result["success"]
+    failed  = result["failed"]
+
+    print(f"✅ Sent: {success}")
+    print(f"❌ Failed: {failed}")
 
     return {
-        "status":        "success" if not failed else "partial",
-        "sent_to":       success,
-        "failed":        failed,
-        "total_sent":    len(success),
-        "total_failed":  len(failed)
+        "status":       "success" if not failed else "partial",
+        "sent_to":      success,
+        "failed":       failed,
+        "total_sent":   len(success),
+        "total_failed": len(failed)
     }
-
 
 # ══════════════════════════════════════════════════════════
 # Health check
 # ══════════════════════════════════════════════════════════
 @app.get("/")
 def root():
-    return {"status": "MeetAI API is running."}
+    return {
+        "status":       "MeetAI API is running.",
+        "smtp_email":   SMTP_EMAIL or "NOT SET",
+        "mongo_url":    "SET" if MONGO_URL else "NOT SET",
+        "groq_key":     "SET" if GROQ_API_KEY else "NOT SET"
+    }
